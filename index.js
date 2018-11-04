@@ -11,17 +11,16 @@
 *   worker: (finish) => { complexOperation(finish) }
 * };
 * @example Somewhere else in the application
-* app.agents.get('widgets', (err, value) => { ... });
+* agents.get('widgets', (err, value) => { ... });
 */
 
 // NOTE: Since the agents.js module is loaded in different environments the following list is incomplete - scan the code for /require/ for the full list of deps
 var _ = require('lodash').mixin(require('lodash-keyarrange'));
 var argy = require('argy');
 var async = require('async-chainable');
-var colors = require('colors');
+var colors = require('chalk');
 var CronJob = require('cron').CronJob;
 var cronTranslate = require('cronstrue').toString;
-var dumper = require('dumper.js').dump;
 var fspath = require('path');
 var glob = require('glob');
 var humanize = require('humanize');
@@ -32,6 +31,102 @@ var agents = {};
 module.exports = agents;
 
 
+// Config {{{
+/**
+* Agents config
+*/
+agents.config = {
+	enabled: true,
+	schedule: false,
+	allowImmediate: true,
+	context: { // Additional context functions to load
+	},
+	discovery: {
+		autoInstall: true, // Whether any discovered agents should be installed as a cronjob
+		paths: [], // Scan these globs when loading agent files
+	},
+	methods: {
+		force: false,
+		inline: true,
+		pm2: true,
+		aws: false,
+	},
+	cache: [
+		()=> process.env.AGENT_LAMBDA ? 'redis' : undefined,
+		()=> (agent, config) => agent.method == 'aws' ? 'redis' : undefined,
+		'filesystem',
+	],
+	bootstrapper: {
+		url: `http://someurl.com/api/agents/package.zip`,
+		user: 'cho6Ahtohqua9Woogh7uhaeyiePhoo6iegaequ9hi0au1ongup2Eicaich6IeW2r',
+		pass: 'paechake2aihuo8geeteutem6aibengauke5uGhice3yaithoowuzoph3fuphaig',
+	},
+};
+
+
+/**
+* Set a config key or merge a config object
+* @param {string|array|object} key Either a single config key to set (with a value) or an object to merge over the existing config. Key can use dotted notation or array notation for deep keys
+* @param {*} val The value if setting one key
+* @returns {Agents} This chainable object
+*/
+agents.set = (key, val) => {
+	if (_.isString(key)) {
+		_.set(agents.config, key, val);
+	} else {
+		_.merge(agents.config, key);
+	}
+	return agents;
+};
+// }}}
+
+
+// Initialization {{{
+/**
+* Bootstrap the main agent object (including refreshing the list of agents)
+* NOTE: This automatically calls `agents.refresh()`
+* @returns {Promise}
+*/
+agents.setup = finish =>
+	async()
+		// Load available agents (if we havn't already) {{{
+		.then('agents', function(next) {
+			if (agents._agents && !_.isEmpty(agents._agents)) return next(null, agents._agents);
+			agents.refresh(next);
+		})
+		// }}}
+		// Setup all jobs {{{
+		.forEach('agents', function(next, agentWorker, id) {
+			if (!agentWorker.timing || !agents.config.discovery.autoInstall) return next(); // No timing - don't bother registering
+
+			agentWorker.cronJob = new CronJob({
+				cronTime: agentWorker.timing,
+				onTick: ()=> {
+					console.log(colors.blue('[agents]'), 'Refreshing agent', colors.cyan(id), 'from cron timing', colors.cyan(agentWorker.timing), colors.grey(`(${cronTranslate(agentWorker.timing)})`));
+					agents.run(id);
+				},
+				start: agents.config.schedule, // Means schedule the item in the cron queue, not actually run the tick
+			});
+
+			if (agents.config.schedule) console.log(colors.blue('[agents]'), 'Installed agent', colors.cyan(id), 'with timing', colors.cyan(agentWorker.timing), colors.grey(`(${cronTranslate(agentWorker.timing)})`));
+			next();
+		})
+		// }}}
+		// Run all agents marked as immediate {{{
+		.forEach('agents', function(next, agentWorker, id) {
+			if (!agentWorker.immediate || !agents.config.allowImmediate) return next();
+			console.log(colors.blue('[agents]'), 'Agent', colors.cyan(id), 'marked for immediate run!');
+			agents.run(id, next);
+		})
+		// }}}
+		.then(function(next) {
+			if (!agents.config.schedule) console.log(colors.blue('[agents]'), 'Agent scheduling is disabled');
+			next();
+		})
+		.promise(finish);
+// }}}
+
+// Agent instances / loading {{{
 /**
 * Collection of agent services
 * All are loaded from **.agent.js
@@ -41,7 +136,7 @@ module.exports = agents;
 * @param {string} [expires] How long the value should be retained (set this to something like '1h' if you dont want to recalc the value with custom settings each time)
 * @param {string} id The ID of the agent to store in the cache
 * @param {boolean} [hasReturn=true] Whether the agent is expected to return something
-* @param {boolean} [immediate=false] Whether to run the agents as soon as the server is ready - should only be used for debugging purposes (only works if app.config.agents.allowImmediate is true)
+* @param {boolean} [immediate=false] Whether to run the agents as soon as the server is ready - should only be used for debugging purposes (only works if agents.config.allowImmediate is true)
 * @param {array} [methods] Which methods are allowed to run the agent, these are processed in first->last priority order with the first matching being used
 * @param {boolean} [show=false] Whether the agent should show up in the agent listing
 * @param {boolean} [clearOnBuild=true] Whether the agent contents should invalidate on each build
@@ -53,26 +148,12 @@ agents._agents = {};
 
 
 /**
-* Tracker for individual versions of agents + settings that are running
-* @var {Object}
-* @param {boolean} [isRunning] Whether the job is currently running
-* @param {array <function>} [waiting] List of functions waiting for the result of the worker - register a callback into this if you want the next available result
+* Load an agent, either by loading it from a file or directly from an object
+* @param {string|Object} agent Either a path on disk to load the agent from or an Object matching the agent spec
+* @returns {Agents} This chainable object
 */
-agents._running = {};
-
-
-/**
-* Whether any discovered agents should be installed as a cronjob
-* @var {boolean}
-*/
-agents._autoInstall = true;
-
-
-/**
-* How long to pause between agent context logThrottled updates
-* @var {number}
-*/
-agents._logThrottle = 250;
+agents.register = agent => {
+};
 
 
 /**
@@ -82,24 +163,33 @@ agents._logThrottle = 250;
 agents.refresh = function(finish) {
 	async()
 		// Glob all agents {{{
-		.then('paths', next => glob(`${app.config.paths.root}/units/**/*.agent.js`, next))
+		.map('paths', _.castArray(agents.config.discovery.paths), function(next, path) {
+			glob(path, next);
+		})
+		.then('paths', function(next) {
+			next(null, _.flatten(this.paths));
+		})
 		// }}}
 		// Assign all found agents to a lookup object {{{
 		.then(function(next) {
-			agents._agents = _(this.paths)
-				.mapKeys(path => {
-					var module = require(path);
-					if (!module.id) console.log(colors.blue('[agents]'), colors.yellow('WARNING'), 'agent path', colors.cyan(path), 'does not have an ID or look like a valid agent - skipped');
-					return module.id;
-				})
-				.mapValues(path => require(path))
-				.mapValues((v, k) => _.set(v, 'context',  agents.createContext({
-					id: k,
-				})))
-				.pickBy((v, k) => k !== 'undefined') // Only include agent that have a valid ID
-				.value();
+			try {
+				agents._agents = _(this.paths)
+					.mapKeys(path => {
+						var module = require(path);
+						if (!module.id) console.log(colors.blue('[agents]'), colors.yellow('WARNING'), 'agent path', colors.cyan(path), 'does not have an ID or look like a valid agent - skipped');
+						return module.id;
+					})
+					.mapValues(path => require(path))
+					.mapValues((v, k) => _.set(v, 'context',  agents.createContext({
+						id: k,
+					})))
+					.pickBy((v, k) => k !== 'undefined') // Only include agent that have a valid ID
+					.value();
 
-			next();
+					next();
+			} catch (e) {
+				next(e);
+			}
 		})
 		// }}}
 		// Output list of loaded agents {{{
@@ -115,6 +205,25 @@ agents.refresh = function(finish) {
 		})
 		// }}}
 };
+// }}}
+
+
+/**
+* Tracker for individual versions of agents + settings that are running
+* @var {Object}
+* @param {boolean} [isRunning] Whether the job is currently running
+* @param {array <function>} [waiting] List of functions waiting for the result of the worker - register a callback into this if you want the next available result
+*/
+agents._running = {};
+
+
+/**
+* How long to pause between agent context logThrottled updates
+* @var {number}
+*/
+agents._logThrottle = 250;
+
+
 
 
 /**
@@ -125,47 +234,6 @@ agents.refresh = function(finish) {
 agents.has = id => !! agents._agents[id];
 
 
-/**
-* Setup an agents with scheduling
-*/
-agents.setup = function(finish) {
-	async()
-		// Load available agents (if we havn't already) {{{
-		.then('agents', function(next) {
-			if (agents._agents && !_.isEmpty(agents._agents)) return next(null, agents._agents);
-			agents.refresh(next);
-		})
-		// }}}
-		// Setup all jobs {{{
-		.forEach('agents', function(next, agentWorker, id) {
-			if (!agentWorker.timing || !agents._autoInstall) return next(); // No timing - don't bother registering
-
-			agentWorker.cronJob = new CronJob({
-				cronTime: agentWorker.timing,
-				onTick: ()=> {
-					console.log(colors.blue('[agents]'), 'Refreshing agent', colors.cyan(id), 'from cron timing', colors.cyan(agentWorker.timing), colors.grey(`(${cronTranslate(agentWorker.timing)})`));
-					agents.run(id);
-				},
-				start: app.config.agents.schedule, // Means schedule the item in the cron queue, not actually run the tick
-			});
-
-			if (app.config.agents.schedule) console.log(colors.blue('[agents]'), 'Installed agent', colors.cyan(id), 'with timing', colors.cyan(agentWorker.timing), colors.grey(`(${cronTranslate(agentWorker.timing)})`));
-			next();
-		})
-		// }}}
-		// Run all agents marked as immediate {{{
-		.forEach('agents', function(next, agentWorker, id) {
-			if (!agentWorker.immediate || !app.config.agents.allowImmediate) return next();
-			console.log(colors.blue('[agents]'), 'Agent', colors.cyan(id), 'marked for immediate run!');
-			agents.run(id, next);
-		})
-		// }}}
-		.then(function(next) {
-			if (!app.config.agents.schedule) console.log(colors.blue('[agents]'), 'Agent scheduling is disabled');
-			next();
-		})
-		.end(finish);
-};
 
 
 /**
@@ -179,7 +247,7 @@ agents.setup = function(finish) {
 */
 agents.get = argy('string [object] [function]', function(id, settings, finish) {
 	// Sanity checks {{{
-	if (!app.agents._agents[id]) throw new Error(`Agent "${id}" is invalid`);
+	if (!agents._agents[id]) throw new Error(`Agent "${id}" is invalid`);
 	// }}}
 	// Compute the cache key to use when communicating (if settings exists) {{{
 	if (!settings) settings = {};
@@ -191,31 +259,31 @@ agents.get = argy('string [object] [function]', function(id, settings, finish) {
 		async()
 			// Determine run method {{{
 			.then('method', function(next) {
-				if (app.config.agents.methods.force) return next(null, app.config.agents.methods.force);
-				if (!app.agents._agents[id].methods) return next(`Agent "${id}" has no execution methods specified`);
-				var method = agents._agents[id].methods.find(m => app.config.agents.methods[m]);
+				if (agents.config.methods.force) return next(null, agents.config.methods.force);
+				if (!agents._agents[id].methods) return next(`Agent "${id}" has no execution methods specified`);
+				var method = agents._agents[id].methods.find(m => agents.config.methods[m]);
 				if (!method) return next('Cannot find available method to execute agent');
 				next(null, method);
 			})
 			// }}}
 			// Determine cache method {{{
 			.then('cache', function(next) {
-				if (!_.get(app, 'config.agents.cache')) return next('No cache method rules defined in app.config.agents.cache');
-				var cache = app.config.agents.cache
+				if (!_.get(app, 'config.agents.cache')) return next('No cache method rules defined in agents.config.cache');
+				var cache = agents.config.cache
 					.map(rule => // Transform functions into their results
 						_.isFunction(rule) ? rule(Object.assign({}, agents._agents[id], {method: this.method}))
 						: rule
 					)
 					.find(rule => rule) // First non-undefined
 
-				if (!cache) return next('Cannot find any cache to use based on rules defined in app.config.agents.cache');
+				if (!cache) return next('Cannot find any cache to use based on rules defined in agents.config.cache');
 				if (!app.caches[cache]) return next(`Need to use caching method "${cache}" but it is not loaded in app.caches`);
 				next(null, cache);
 			})
 			// }}}
 			// Try to access an existing cache value {{{
 			.then('value', function(next) {
-				if (!app.config.agents.enabled) {
+				if (!agents.config.enabled) {
 					console.log(colors.blue('[agents]'), 'agent is disabled, forcing fresh value calculation each time!');
 					return next();
 				} else {
@@ -253,7 +321,7 @@ agents.get = argy('string [object] [function]', function(id, settings, finish) {
 */
 agents.jobSubmit = argy('string [object] function', function(id, settings, finish) {
 	// Sanity checks {{{
-	if (!app.agents._agents[id]) throw new Error(`Agent "${id}" is invalid`);
+	if (!agents._agents[id]) throw new Error(`Agent "${id}" is invalid`);
 	// }}}
 	// Compute the cache key to use when communicating (if settings exists) {{{
 	if (!settings) settings = {};
@@ -263,24 +331,24 @@ agents.jobSubmit = argy('string [object] function', function(id, settings, finis
 	async()
 		// Determine run method {{{
 		.then('method', function(next) {
-			if (app.config.agents.methods.force) return next(null, app.config.agents.methods.force);
+			if (agents.config.methods.force) return next(null, agents.config.methods.force);
 			if (!agents._agents[id].methods) return next(`Agent "${id}" has no execution methods specified`);
-			var method = agents._agents[id].methods.find(m => app.config.agents.methods[m]);
+			var method = agents._agents[id].methods.find(m => agents.config.methods[m]);
 			if (!method) return next('Cannot find available method to execute agent');
 			next(null, method);
 		})
 		// }}}
 		// Determine cache method {{{
 		.then('cache', function(next) {
-			if (!_.get(app, 'config.agents.cache')) return next('No cache method rules defined in app.config.agents.cache');
-			var cache = app.config.agents.cache
+			if (!_.get(app, 'config.agents.cache')) return next('No cache method rules defined in agents.config.cache');
+			var cache = agents.config.cache
 				.map(rule => // Transform functions into their results
 					_.isFunction(rule) ? rule(Object.assign({}, agents._agents[id], {method: this.method}))
 					: rule
 				)
 				.find(rule => rule) // First non-undefined
 
-			if (!cache) return next('Cannot find any cache to use based on rules defined in app.config.agents.cache');
+			if (!cache) return next('Cannot find any cache to use based on rules defined in agents.config.cache');
 			if (!app.caches[cache]) return next(`Need to use caching method "${cache}" but it is not loaded in app.caches`);
 			next(null, cache);
 		})
@@ -425,7 +493,6 @@ agents.createContext = (settings) => {
 	// Basic logging {{{
 	Object.assign(context, {
 		colors: colors,
-		dump: dumper,
 		log: (...msg) => console.log.apply(this, [colors.blue(`[agents / ${settings.id}]`)].concat(msg)),
 		logThrottled: _.throttle((...msg) => console.log.apply(this, [colors.blue(`[agents / ${settings.id}]`)].concat(msg)), agents._logThrottle),
 		warn: (...msg) => console.log.apply(this, [colors.blue(`[agents / ${settings.id}]`), colors.yellow('WARNING')].concat(msg)),
@@ -473,6 +540,10 @@ agents.createContext = (settings) => {
 	});
 	// }}}
 
+	// Custom supplied contexts {{{
+	Object.assign(context, agents.config.context);
+	// }}}
+
 	return context;
 };
 
@@ -480,7 +551,7 @@ agents.createContext = (settings) => {
 /**
 * Run the worker and cache the result
 *
-* WARNING: You almost always want the app.agents.get() function instead of app.agents.run()
+* WARNING: You almost always want the agents.get() function instead of agents.run()
 *          This function will ALWAYS run the agent, whereas get() provides a cached result if there is one
 *
 * @param {string} id The ID of the worker result to return
@@ -493,7 +564,7 @@ agents.createContext = (settings) => {
 */
 agents.run = argy('string [object] [function]', function(id, settings, finish) {
 	// Sanity checks {{{
-	if (!app.agents._agents[id]) throw new Error(`Agent "${id}" is invalid`);
+	if (!agents._agents[id]) throw new Error(`Agent "${id}" is invalid`);
 	// }}}
 	// Compute the cache key to use when communicating (if settings exists) {{{
 	if (!settings) settings = {};
@@ -521,29 +592,29 @@ agents.run = argy('string [object] [function]', function(id, settings, finish) {
 			.set('startTime', Date.now())
 			// Determine run method {{{
 			.then('method', function(next) {
-				if (app.config.agents.methods.force) return next(null, app.config.agents.methods.force);
+				if (agents.config.methods.force) return next(null, agents.config.methods.force);
 				if (!agents._agents[id].methods) return next(`Agent "${id}" has no execution methods specified`);
-				var method = agents._agents[id].methods.find(m => app.config.agents.methods[m]);
+				var method = agents._agents[id].methods.find(m => agents.config.methods[m]);
 				if (!method) return next('Cannot find available method to execute agent');
 				next(null, method);
 			})
 			// }}}
 			// Determine cache method {{{
 			.then('cache', function(next) {
-				if (!_.get(app, 'config.agents.cache')) return next('No cache method rules defined in app.config.agents.cache');
-				var cache = app.config.agents.cache
+				if (!_.get(app, 'config.agents.cache')) return next('No cache method rules defined in agents.config.cache');
+				var cache = agents.config.cache
 					.map(rule => // Transform functions into their results
 						_.isFunction(rule) ? rule(Object.assign({}, agents._agents[id], {method: this.method}))
 						: rule
 					)
 					.find(rule => rule) // First non-undefined
 
-				if (!cache) return next('Cannot find any cache to use based on rules defined in app.config.agents.cache');
+				if (!cache) return next('Cannot find any cache to use based on rules defined in agents.config.cache');
 				if (!app.caches[cache]) return next(`Need to use caching method "${cache}" but it is not loaded in app.caches`);
 				next(null, cache);
 			})
 			.then(function(next) {
-				console.log(colors.blue(`[agents / ${cacheKey}]`), 'Using method', colors.cyan(this.method), app.config.agents.methods.force ? colors.grey('(forced)') : '');
+				console.log(colors.blue(`[agents / ${cacheKey}]`), 'Using method', colors.cyan(this.method), agents.config.methods.force ? colors.grey('(forced)') : '');
 				console.log(colors.blue(`[agents / ${cacheKey}]`), 'Using cache', colors.cyan(this.cache));
 				next();
 			})
@@ -584,7 +655,7 @@ agents.run = argy('string [object] [function]', function(id, settings, finish) {
 									}
 
 									// Stash the calculated result in the cache
-									if (!app.config.agents.enabled) { // Caching disabled
+									if (!agents.config.enabled) { // Caching disabled
 										next(null, value);
 									} else if (_.isString(agents._agents[id].expires) && agents._agents[id].expires) { // Stash value with an expiry
 										var expiry = new Date(Date.now() + (timestring(agents._agents[id].expires) * 1000));
@@ -753,9 +824,9 @@ agents.run = argy('string [object] [function]', function(id, settings, finish) {
 									jobQueue: _.get(app, 'config.aws.batch.queue', 'doop-agents-queue'),
 									containerOverrides: {
 										environment: [
-											{name: 'DA_URL', value: app.config.agents.bootstrapper.url},
-											{name: 'DA_URL_USER', value: app.config.agents.bootstrapper.user},
-											{name: 'DA_URL_PASS', value: app.config.agents.bootstrapper.pass},
+											{name: 'DA_URL', value: agents.config.bootstrapper.url},
+											{name: 'DA_URL_USER', value: agents.config.bootstrapper.user},
+											{name: 'DA_URL_PASS', value: agents.config.bootstrapper.pass},
 											{name: 'DA_AGENT', value: id},
 											{name: 'DA_AGENT_SETTINGS', value: JSON.stringify(settings)},
 											{name: 'DA_CACHE', value: this.cache},
@@ -827,7 +898,7 @@ agents.run = argy('string [object] [function]', function(id, settings, finish) {
 
 					// Unknown task runner {{{
 					default:
-						throw new Error(`Unknown task agent method: "${app.config.agents.method}"`);
+						throw new Error(`Unknown task agent method: "${agents.config.method}"`);
 					// }}}
 				}
 			})
@@ -876,7 +947,7 @@ agents.run = argy('string [object] [function]', function(id, settings, finish) {
 */
 agents.invalidate = argy('string [object] [function]', function(id, settings, finish) {
 	// Sanity checks {{{
-	if (!app.agents._agents[id]) throw new Error(`Agent "${id}" is invalid`);
+	if (!agents._agents[id]) throw new Error(`Agent "${id}" is invalid`);
 	// }}}
 	// Compute the cache key to use when communicating (if settings exists) {{{
 	if (!settings) settings = {};
@@ -886,24 +957,24 @@ agents.invalidate = argy('string [object] [function]', function(id, settings, fi
 	async()
 		// Determine run method {{{
 		.then('method', function(next) {
-			if (app.config.agents.methods.force) return next(null, app.config.agents.methods.force);
+			if (agents.config.methods.force) return next(null, agents.config.methods.force);
 			if (!agents._agents[id].methods) return next(`Agent "${id}" has no execution methods specified`);
-			var method = agents._agents[id].methods.find(m => app.config.agents.methods[m]);
+			var method = agents._agents[id].methods.find(m => agents.config.methods[m]);
 			if (!method) return next('Cannot find available method to execute agent');
 			next(null, method);
 		})
 		// }}}
 		// Determine cache method {{{
 		.then('cache', function(next) {
-			if (!_.get(app, 'config.agents.cache')) return next('No cache method rules defined in app.config.agents.cache');
-			var cache = app.config.agents.cache
+			if (!_.get(app, 'config.agents.cache')) return next('No cache method rules defined in agents.config.cache');
+			var cache = agents.config.cache
 				.map(rule => // Transform functions into their results
 					_.isFunction(rule) ? rule(Object.assign({}, agents._agents[id], {method: this.method}))
 					: rule
 				)
 				.find(rule => rule) // First non-undefined
 
-			if (!cache) return next('Cannot find any cache to use based on rules defined in app.config.agents.cache');
+			if (!cache) return next('Cannot find any cache to use based on rules defined in agents.config.cache');
 			if (!app.caches[cache]) return next(`Need to use caching method "${cache}" but it is not loaded in app.caches`);
 			next(null, cache);
 		})
