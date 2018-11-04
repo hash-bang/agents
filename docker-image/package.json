@@ -1,0 +1,19 @@
+{
+  "name": "doop-agent",
+  "version": "0.0.0",
+  "description": "Minimal instance to bootstrap a Doop agent file",
+  "scripts": {
+    "start": "node bootstrap.js"
+  },
+  "author": "Matt Carter <m@ttcarter.com>",
+  "license": "MIT",
+  "dependencies": {
+    "chalk": "^2.4.1",
+    "superagent": "^3.8.3",
+    "unzipper": "^0.9.3"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MomsFriendlyDevCo/Doop.git"
+  }
+}
